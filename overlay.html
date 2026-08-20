@@ -21,9 +21,11 @@ const P = {
   taper:          0.6,   // tip segment is this fraction of base length
 
   // Physics
+  physicsHz:      60,    // fixed simulation rate; preserves original 60 Hz tuning on every display
+  maxCatchUpSteps: 5,    // prevent long stalls/backgrounding from causing a physics burst
   gravity:        1.2,   // normal gravity
   dropGravity:    0.95,    // gravity when dropping/despawning
-  damping:        0.96,  // velocity retention per frame (1 = no loss)
+  damping:        0.96,  // velocity retention per physics step (1 = no loss)
   constraintIters:20,     // higher = stiffer chain
   maxStretchRatio: 1.2,  // hard cap for per-link stretch during fast whips
 
@@ -49,7 +51,7 @@ const P = {
   wallFriction:    0.86,   // tangential damping on wall hit
 
   // Crack detection
-  crackSpeed:     340,     // tip velocity threshold to trigger crack
+  crackSpeed:     20400,   // tip speed threshold in px/s; equivalent to 340 px/frame at 60 Hz
   crackCooldownMs:200,   // min ms between cracks
   firstCrackGraceMs: 350, // no crack (macro) until this long after spawn
 
@@ -84,6 +86,8 @@ let lastCrackTime = 0;
 let whipSpawnTime = 0;
 let handleAngle = P.baseTargetAngle;
 let handleAngVel = 0;
+let lastFrameTime = performance.now();
+let physicsAccumulatorMs = 0;
 
 const WHIP_CRACK_SOUNDS = ['sounds/A.mp3', 'sounds/B.mp3', 'sounds/C.mp3', 'sounds/D.mp3', 'sounds/E.mp3'];
 
@@ -353,11 +357,12 @@ function update() {
     applyWallCollisions();
   }
 
-  // Tip velocity for crack detection
+  // Tip speed for crack detection. Physics runs at a fixed rate, so convert the
+  // per-step Verlet displacement to px/s before comparing with the threshold.
   const tip = whip[whip.length - 1];
-  const tipVel = Math.hypot(tip.x - tip.px, tip.y - tip.py);
+  const tipSpeed = Math.hypot(tip.x - tip.px, tip.y - tip.py) * P.physicsHz;
 
-  if (!dropping && tipVel > P.crackSpeed) {
+  if (!dropping && tipSpeed > P.crackSpeed) {
     const now = Date.now();
     if (now - whipSpawnTime >= P.firstCrackGraceMs && now - lastCrackTime > P.crackCooldownMs) {
       lastCrackTime = now;
@@ -428,12 +433,35 @@ function draw() {
 }
 
 // ── Main loop ───────────────────────────────────────────────────────────────
-function loop() {
-  update();
+function resetPhysicsClock() {
+  lastFrameTime = performance.now();
+  physicsAccumulatorMs = 0;
+}
+
+function loop(now) {
+  const stepMs = 1000 / P.physicsHz;
+  const maxElapsedMs = stepMs * P.maxCatchUpSteps;
+  const elapsedMs = clamp(now - lastFrameTime, 0, maxElapsedMs);
+  lastFrameTime = now;
+  physicsAccumulatorMs += elapsedMs;
+
+  let steps = 0;
+  while (physicsAccumulatorMs >= stepMs && steps < P.maxCatchUpSteps) {
+    update();
+    physicsAccumulatorMs -= stepMs;
+    steps++;
+  }
+
+  // If the renderer was stalled/backgrounded for too long, discard excess time
+  // instead of replaying a large burst of old physics when it resumes.
+  if (steps === P.maxCatchUpSteps && physicsAccumulatorMs >= stepMs) {
+    physicsAccumulatorMs = 0;
+  }
+
   draw();
   requestAnimationFrame(loop);
 }
-loop();
+requestAnimationFrame(loop);
 
 // ── IPC from main process ───────────────────────────────────────────────────
 window.bridge.onSpawnWhip(() => {
@@ -443,6 +471,7 @@ window.bridge.onSpawnWhip(() => {
   prevMouseY = mouseY;
   handleAngle = P.baseTargetAngle;
   handleAngVel = 0;
+  resetPhysicsClock();
 });
 
 window.bridge.onDropWhip(() => {
